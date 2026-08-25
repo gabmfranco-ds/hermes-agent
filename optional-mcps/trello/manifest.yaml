@@ -1,0 +1,70 @@
+# Nous-approved MCP catalog entry.
+# Presence in this directory = approval. Merged via PR review.
+#
+# Schema version 1.
+manifest_version: 1
+
+name: trello
+description: Read and manage Trello boards, lists, cards, checklists, and comments.
+source: https://github.com/delorenj/mcp-server-trello
+
+# npm-published stdio server (no install/clone step — `npx -y` IS the
+# install). Pinned to an exact version per the catalog's supply-chain rule
+# (exact versions for package launchers); 1.8.1 was published 2026-07-25,
+# comfortably over the 2-week-old bar at pin time.
+#
+# `env` intentionally repeats the auth.env var names as ${VAR} interpolation
+# templates (resolved from ~/.hermes/.env at connect time, same mechanism
+# HTTP+api_key entries use for their Authorization header). For stdio
+# transports, Hermes only forwards whatever is explicitly listed under
+# `env:` to the subprocess (see tools/mcp_tool.py:_build_safe_env) — a
+# secret declared only in `auth.env` never reaches the child process on its
+# own, so any stdio + api_key manifest whose server reads credentials
+# straight from its own environment (rather than loading its own dotenv)
+# needs this explicit passthrough.
+transport:
+  type: stdio
+  command: "npx"
+  args: ["-y", "@delorenj/mcp-server-trello@1.8.1"]
+  env:
+    TRELLO_API_KEY: "${TRELLO_API_KEY}"
+    TRELLO_TOKEN: "${TRELLO_TOKEN}"
+
+# Authentication. Three shapes:
+#   type: api_key  — prompt for env vars, write to ~/.hermes/.env
+#   type: oauth    — provider-mediated or remote MCP native OAuth (case 1/2)
+#   type: none     — no credentials needed
+auth:
+  type: api_key
+  env:
+    - name: TRELLO_API_KEY
+      prompt: "Trello API key (trello.com/power-ups/admin → your app → API Key)"
+      required: true
+      secret: true
+    - name: TRELLO_TOKEN
+      prompt: "Trello token (same page → click 'Token' next to the API key → Allow)"
+      required: true
+      secret: true
+
+# Composer-suggestion triggers (desktop brand pills).
+suggest:
+  keywords:
+    - trello
+  hosts:
+    - trello.com
+
+# Tool selection at install time:
+# The server exposes 57 tools. Everything stays enabled by default — Trello
+# has no bulk-destructive tool comparable to n8n's activate/deactivate, and
+# archive/delete calls act on one card/list/label at a time.
+
+post_install: |
+  Generate credentials at https://trello.com/power-ups/admin:
+    1. Open (or create) an app, then the "API Key" tab. Copy the API Key.
+    2. Click the "Token" link next to it, choose the scopes you want
+       (read/write/account), and Allow. Copy the token shown.
+
+  The API key on its own is not sensitive (it just identifies the app) —
+  the token grants real account access. Treat it like any other credential.
+
+  Start a new Hermes session to load the Trello tools.
