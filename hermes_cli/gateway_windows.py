@@ -65,6 +65,15 @@ _TASK_LOGON_DELAY = "PT30S"
 _TASK_RESTART_INTERVAL = "PT1M"
 _TASK_RESTART_COUNT = 999
 
+# In-.vbs supervision loop (see ``_build_gateway_vbs_script``): backoff between
+# relaunches, plus a crash-loop cap so a gateway that dies instantly forever
+# doesn't spin the CPU/log forever — it exits non-zero instead and lets the
+# Scheduled Task's own ``RestartOnFailure`` (1 min backoff, up to 999 times)
+# take over.
+_VBS_RESTART_BACKOFF_MS = 5000
+_VBS_MAX_RESTARTS_PER_WINDOW = 10
+_VBS_RESTART_WINDOW_S = 3600
+
 
 def _schtasks_encoding() -> str:
     """Best-effort console encoding for decoding ``schtasks.exe`` output.
@@ -476,6 +485,26 @@ def _build_gateway_vbs_script(
     flash). No cmd.exe anywhere in the chain. Mirrors
     ``_build_gateway_cmd_script`` (same env + argv via
     ``_resolve_detached_python``).
+
+    Supervision loop: ``sh.Run`` is called with ``bWaitOnReturn=True`` inside
+    a ``Do While`` loop instead of the old fire-and-forget ``False``. This is
+    orthogonal to the console-allocation fix above — ``bWaitOnReturn`` only
+    controls whether ``WScript.Shell.Run`` blocks the *caller* until the
+    child exits; it does not touch the child's window style, subsystem, or
+    console inheritance, so it cannot reintroduce #45599. What it fixes is a
+    *different* bug: with ``False``, ``wscript.exe`` launched the gateway and
+    exited immediately, so the Scheduled Task reported "success" the instant
+    the gateway started — Task Scheduler then lost all track of the real
+    process, and ``RestartOnFailure`` never fired no matter how or when the
+    gateway later died. With ``True``, ``wscript.exe`` stays alive for as
+    long as the gateway does; when the gateway exits, the loop sleeps
+    ``_VBS_RESTART_BACKOFF_MS`` and relaunches it directly (fast path, no
+    Task Scheduler round-trip). If the gateway is crash-looping (more than
+    ``_VBS_MAX_RESTARTS_PER_WINDOW`` deaths inside a rolling
+    ``_VBS_RESTART_WINDOW_S`` window), the loop gives up and exits non-zero
+    so ``wscript.exe`` itself is seen as "failed" — only then does the Task's
+    own ``RestartOnFailure`` (1 min backoff) take over as the slower outer
+    safety net.
     """
     python_exe_path, venv_dir, extra_pythonpath = _resolve_detached_python(python_path)
 
@@ -494,7 +523,7 @@ def _build_gateway_vbs_script(
     lines = [
         f"' {_TASK_DESCRIPTION}",
         "Option Explicit",
-        "Dim sh, env, existing_pp",
+        "Dim sh, env, existing_pp, command_line, restart_count, window_start",
         'Set sh = CreateObject("WScript.Shell")',
         'Set env = sh.Environment("PROCESS")',
         f"env.Item({_quote_vbs_string('HERMES_HOME')}) = {_quote_vbs_string(hermes_home)}",
@@ -510,10 +539,29 @@ def _build_gateway_vbs_script(
         f"  env.Item({_quote_vbs_string('PYTHONPATH')}) = {_quote_vbs_string(static_pythonpath)}",
         "End If",
         f"sh.CurrentDirectory = {_quote_vbs_string(working_dir)}",
-        # Window style 0 = hidden; bWaitOnReturn False = detached/async. The
-        # console python's one console is created hidden and inherited by all
-        # descendants, so nothing ever flashes.
-        f"sh.Run {_quote_vbs_string(command_line)}, 0, False",
+        f"command_line = {_quote_vbs_string(command_line)}",
+        # Window style 0 = hidden; bWaitOnReturn True = block wscript.exe until
+        # the gateway process exits. This keeps wscript.exe (and therefore the
+        # Scheduled Task) alive for the gateway's whole lifetime, so a real
+        # crash is visible to Task Scheduler instead of vanishing the instant
+        # the gateway is launched. See the docstring above for why this is
+        # orthogonal to the #45599 console-allocation fix.
+        "restart_count = 0",
+        "window_start = Now",
+        "Do While True",
+        "  sh.Run command_line, 0, True",
+        f"  If DateDiff(\"s\", window_start, Now) > {_VBS_RESTART_WINDOW_S} Then",
+        "    window_start = Now",
+        "    restart_count = 0",
+        "  End If",
+        "  restart_count = restart_count + 1",
+        # Crash-loop cap: give up and let the Task's own RestartOnFailure
+        # (slower, 1 min backoff) take over instead of respawning forever.
+        f"  If restart_count > {_VBS_MAX_RESTARTS_PER_WINDOW} Then",
+        "    WScript.Quit 1",
+        "  End If",
+        f"  WScript.Sleep {_VBS_RESTART_BACKOFF_MS}",
+        "Loop",
     ]
     return "\r\n".join(lines) + "\r\n"
 

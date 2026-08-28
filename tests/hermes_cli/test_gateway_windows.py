@@ -333,11 +333,39 @@ def test_gateway_vbs_script_is_console_less(monkeypatch):
     assert "pythonw.exe" in content
     assert "hermes_cli.main" in content
     assert "gateway run" in content
-    assert ", 0, False" in content  # hidden window, detached/async
+    assert "sh.Run command_line, 0, True" in content  # hidden window, blocks until gateway exits
     for var in ("HERMES_HOME", "PYTHONIOENCODING", "HERMES_GATEWAY_DETACHED", "VIRTUAL_ENV", "PYTHONPATH"):
         assert var in content
     assert "--profile" in content and "work" in content
     assert content.endswith("\r\n")
+
+
+def test_gateway_vbs_script_has_supervision_loop(monkeypatch):
+    """wscript.exe must stay alive and relaunch the gateway when it dies, with
+    a crash-loop cap so a gateway that dies instantly doesn't spin forever.
+
+    This is the actual watchdog fix: with the old ``bWaitOnReturn=False``,
+    wscript.exe exited the instant the gateway launched, so Task Scheduler
+    never saw the gateway die and ``RestartOnFailure`` never fired.
+    """
+    monkeypatch.setattr(
+        gateway_windows,
+        "_resolve_detached_python",
+        lambda exe: (r"C:\venv\Scripts\pythonw.exe", Path(r"C:\venv"), []),
+    )
+    content = gateway_windows._build_gateway_vbs_script(
+        r"C:\venv\Scripts\python.exe",
+        r"C:\Hermes",
+        r"C:\Hermes",
+        "--profile work",
+    )
+    assert "Do While True" in content
+    assert "Loop" in content
+    assert "sh.Run command_line, 0, True" in content
+    assert f"WScript.Sleep {gateway_windows._VBS_RESTART_BACKOFF_MS}" in content
+    assert "restart_count = restart_count + 1" in content
+    assert f"restart_count > {gateway_windows._VBS_MAX_RESTARTS_PER_WINDOW}" in content
+    assert "WScript.Quit 1" in content
 
 
 
