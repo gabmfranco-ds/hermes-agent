@@ -26,11 +26,12 @@ This module closes that gap with a tiny state machine persisted to
   exits, #53107) and the two watchdog ``os._exit`` sites in
   :mod:`gateway.shutdown_watchdog`.
 
-:func:`sample_memory` provides the cheap (<1ms, pure /proc reads) memory
-snapshot that :func:`gateway.shutdown_watchdog.write_loop_heartbeat`
-embeds in the 30s heartbeat — giving every unclean-death report a
-"memory available N seconds before death" data point so OOM crash cycles
-are classifiable from the volume alone (no Prometheus retention races).
+:func:`sample_memory` provides the cheap memory snapshot (<1ms pure /proc
+reads on Linux, ``psutil`` elsewhere) that
+:func:`gateway.shutdown_watchdog.write_loop_heartbeat` embeds in the 30s
+heartbeat — giving every unclean-death report a "memory available N seconds
+before death" data point so OOM crash cycles are classifiable from the
+volume alone (no Prometheus retention races).
 
 Everything here is best-effort: a forensics failure must never affect the
 gateway lifecycle it is observing.
@@ -41,6 +42,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -77,35 +79,54 @@ def get_lifecycle_sentinel_path(home: Optional[Path] = None) -> Path:
 def sample_memory() -> Dict[str, Any]:
     """Cheap memory snapshot: own RSS + system availability + swap.
 
-    Pure ``/proc`` reads, Linux-only (returns ``{}`` elsewhere), never
-    raises.  Values in KiB to match the kernel's units.
+    On Linux, pure ``/proc`` reads (<1ms, no extra deps). Elsewhere (Windows,
+    macOS), falls back to ``psutil`` — the same optional hermes-agent
+    dependency already used by :mod:`gateway.agent_cache_pressure` and
+    :mod:`gateway.memory_monitor`. Either path returns the same KiB-keyed
+    dict so ledger consumers don't care which one filled it in. Never
+    raises — returns ``{}`` (or a partial dict) on any failure, including a
+    missing/broken ``psutil`` install.
     """
     sample: Dict[str, Any] = {}
-    try:
-        with open("/proc/self/status", encoding="utf-8") as fh:
-            for line in fh:
-                if line.startswith("VmRSS:"):
-                    sample["rss_kib"] = int(line.split()[1])
-                    break
-    except (OSError, ValueError, IndexError):
-        pass
-    try:
-        meminfo: Dict[str, int] = {}
-        wanted = {"MemTotal", "MemAvailable", "SwapTotal", "SwapFree"}
-        with open("/proc/meminfo", encoding="utf-8") as fh:
-            for line in fh:
-                key = line.split(":", 1)[0]
-                if key in wanted:
-                    meminfo[key] = int(line.split()[1])
-                    if len(meminfo) == len(wanted):
+    if sys.platform.startswith("linux"):
+        try:
+            with open("/proc/self/status", encoding="utf-8") as fh:
+                for line in fh:
+                    if line.startswith("VmRSS:"):
+                        sample["rss_kib"] = int(line.split()[1])
                         break
-        if "MemTotal" in meminfo:
-            sample["mem_total_kib"] = meminfo["MemTotal"]
-        if "MemAvailable" in meminfo:
-            sample["mem_available_kib"] = meminfo["MemAvailable"]
-        if "SwapTotal" in meminfo and "SwapFree" in meminfo:
-            sample["swap_used_kib"] = meminfo["SwapTotal"] - meminfo["SwapFree"]
-    except (OSError, ValueError, IndexError):
+        except (OSError, ValueError, IndexError):
+            pass
+        try:
+            meminfo: Dict[str, int] = {}
+            wanted = {"MemTotal", "MemAvailable", "SwapTotal", "SwapFree"}
+            with open("/proc/meminfo", encoding="utf-8") as fh:
+                for line in fh:
+                    key = line.split(":", 1)[0]
+                    if key in wanted:
+                        meminfo[key] = int(line.split()[1])
+                        if len(meminfo) == len(wanted):
+                            break
+            if "MemTotal" in meminfo:
+                sample["mem_total_kib"] = meminfo["MemTotal"]
+            if "MemAvailable" in meminfo:
+                sample["mem_available_kib"] = meminfo["MemAvailable"]
+            if "SwapTotal" in meminfo and "SwapFree" in meminfo:
+                sample["swap_used_kib"] = meminfo["SwapTotal"] - meminfo["SwapFree"]
+        except (OSError, ValueError, IndexError):
+            pass
+        return sample
+
+    try:
+        import psutil  # type: ignore
+
+        proc = psutil.Process(os.getpid())
+        sample["rss_kib"] = int(proc.memory_info().rss / 1024)
+        vm = psutil.virtual_memory()
+        sample["mem_total_kib"] = int(vm.total / 1024)
+        sample["mem_available_kib"] = int(vm.available / 1024)
+        sample["swap_used_kib"] = int(psutil.swap_memory().used / 1024)
+    except Exception:
         pass
     return sample
 

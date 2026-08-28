@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import types
 from pathlib import Path
 
 import pytest
@@ -73,6 +74,47 @@ def test_sample_memory_has_expected_keys_on_linux() -> None:
     assert sample.get("rss_kib", 0) > 0
     assert sample.get("mem_total_kib", 0) > 0
     assert "mem_available_kib" in sample
+
+
+def test_sample_memory_uses_psutil_off_linux(monkeypatch) -> None:
+    """Windows/macOS have no /proc — sample_memory() must fall back to psutil
+    and return the exact same KiB-keyed shape the Linux /proc path returns,
+    so ledger consumers (memory_status, kanban_db, shutdown_watchdog) don't
+    need to know which platform filled the dict in."""
+    monkeypatch.setattr(sys, "platform", "win32")
+
+    class _FakePsutil:
+        @staticmethod
+        def Process(pid):
+            return types.SimpleNamespace(
+                memory_info=lambda: types.SimpleNamespace(rss=100 * 1024 * 1024)
+            )
+
+        @staticmethod
+        def virtual_memory():
+            return types.SimpleNamespace(total=8 * 1024**3, available=2 * 1024**3)
+
+        @staticmethod
+        def swap_memory():
+            return types.SimpleNamespace(used=512 * 1024 * 1024)
+
+    monkeypatch.setitem(sys.modules, "psutil", _FakePsutil)
+
+    assert sample_memory() == {
+        "rss_kib": 100 * 1024,
+        "mem_total_kib": 8 * 1024 * 1024,
+        "mem_available_kib": 2 * 1024 * 1024,
+        "swap_used_kib": 512 * 1024,
+    }
+
+
+def test_sample_memory_never_raises_without_psutil(monkeypatch) -> None:
+    """psutil missing/broken must degrade to {}, never propagate — this
+    feeds a 30s heartbeat loop that must never crash the gateway."""
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setitem(sys.modules, "psutil", None)  # forces ImportError
+
+    assert sample_memory() == {}
 
 
 # ---------------------------------------------------------------------------
